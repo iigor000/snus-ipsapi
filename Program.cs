@@ -1,153 +1,102 @@
-using System.Collections.Concurrent;
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Linq;
 
 namespace IndustrialProcessingSystem
 {
     class Program
     {
+        private static object _fileLock = new object();
+
         static async Task Main(string[] args)
         {
-            string configPath = "SystemConfig.xml";
+            // 1. Čitanje konfiguracije
+            Console.WriteLine($"Tražim fajl na: {Path.GetFullPath("SystemConfig.xml")}");
+            XDocument config = XDocument.Load("SystemConfig.xml");
+            var root = config.Root;
 
-            // Load configuration
-            var (workerCount, maxQueueSize, initialJobs) = ConfigurationLoader.LoadConfiguration(configPath);
+            int workerCount = int.Parse(root.Element("WorkerCount").Value);
+            int maxQueue = int.Parse(root.Element("MaxQueueSize").Value);
 
-            Console.WriteLine($"[STARTUP] Loading configuration from {configPath}");
-            Console.WriteLine($"[STARTUP] Worker threads: {workerCount}");
-            Console.WriteLine($"[STARTUP] Max queue size: {maxQueueSize}");
-            Console.WriteLine($"[STARTUP] Initial jobs to load: {initialJobs.Count}");
-            Console.WriteLine();
+            ProcessingSystem system = new ProcessingSystem(workerCount, maxQueue);
 
-            // Create processing system
-            var processingSystem = new ProcessingSystem(workerCount, maxQueueSize);
+            // Pretplata na evente
+            system.JobCompleted += async (id, result, status) => { await WriteLogAsync($"[{DateTime.Now}] [{status}] {id}, {result}"); };
+            system.JobFailed += async (id, result, status) => { await WriteLogAsync($"[{DateTime.Now}] [{status}] {id}, {result}"); };
 
-            // Create event logger
-            var eventLogger = new EventLogger("job_events.log");
+            Console.WriteLine("Sistem inicijalizovan. Učitavam početne poslove iz XML-a...");
 
-            // Subscribe to events
-            processingSystem.JobCompleted += (sender, e) =>
+            // 2. Inicijalno učitavanje poslova iz XML-a
+            foreach (var jobXml in root.Descendants("Job"))
             {
-                Console.WriteLine($"[COMPLETED] Job {e.JobId} ({e.JobType}): Result={e.Result}, Time={e.ExecutionTime.TotalMilliseconds}ms");
-                eventLogger.LogJobCompleted(e.JobId, e.Result, e.JobType);
-            };
-
-            processingSystem.JobFailed += (sender, e) =>
-            {
-                Console.WriteLine($"[FAILED] Job {e.JobId} ({e.JobType}): {e.Reason}, Attempts={e.Attempts}");
-                eventLogger.LogJobFailed(e.JobId, e.Reason, e.JobType, e.Attempts);
-            };
-
-            // Create report generator
-            var reportGenerator = new ReportGenerator(processingSystem);
-            processingSystem.JobCompleted += reportGenerator.OnJobCompleted;
-            processingSystem.JobFailed += reportGenerator.OnJobFailed;
-
-            // Submit initial jobs from configuration
-            Console.WriteLine("[INFO] Submitting initial jobs from configuration...");
-            foreach (var job in initialJobs)
-            {
-                try
+                Job initialJob = new Job
                 {
-                    var handle = processingSystem.Submit(job);
-                    Console.WriteLine($"[SUBMITTED] Job {job.Id} ({job.Type}), Priority: {job.Priority}");
-                }
-                catch (InvalidOperationException ex)
-                {
-                    Console.WriteLine($"[ERROR] Failed to submit job: {ex.Message}");
-                }
+                    Id = Guid.NewGuid(),
+                    Type = Enum.Parse<JobType>(jobXml.Attribute("Type").Value),
+                    Payload = jobXml.Attribute("Payload").Value,
+                    Priority = int.Parse(jobXml.Attribute("Priority").Value)
+                };
+
+                system.Submit(initialJob);
             }
 
-            Console.WriteLine();
-            Console.WriteLine("[INFO] Starting producer threads...");
+            Console.WriteLine("Početni poslovi ubačeni. Pokrećem nasumične producente...");
 
-            // Create producer threads that randomly add new jobs
-            var producerCount = Math.Max(2, workerCount / 2);
-            var producerTasks = new List<Task>();
-            var producerCts = new CancellationTokenSource();
-
-            for (int i = 0; i < producerCount; i++)
+            // 3. Pokretanje "Producenata"
+            for (int i = 0; i < 5; i++)
             {
-                var producerTask = ProducerLoop(
-                    processingSystem,
-                    i,
-                    producerCts.Token
-                );
-                producerTasks.Add(producerTask);
+                Task.Run(() => ProducerLoop(system));
             }
 
-            Console.WriteLine($"[INFO] Started {producerCount} producer threads");
-            Console.WriteLine();
-            Console.WriteLine("Press ENTER to stop the system...");
             Console.ReadLine();
-
-            Console.WriteLine("\n[SHUTDOWN] Stopping producers...");
-            producerCts.Cancel();
-            Task.WaitAll(producerTasks.ToArray(), TimeSpan.FromSeconds(10));
-
-            Console.WriteLine("[SHUTDOWN] Waiting for remaining jobs to complete...");
-            await Task.Delay(5000); // Give some time for jobs to complete
-
-            Console.WriteLine("[SHUTDOWN] Disposing resources...");
-            reportGenerator.Dispose();
-            eventLogger.Dispose();
-            processingSystem.Dispose();
-
-            Console.WriteLine("[SHUTDOWN] System shutdown complete");
         }
 
-        static async Task ProducerLoop(ProcessingSystem processingSystem, int producerId, CancellationToken cancellationToken)
+        private static async Task WriteLogAsync(string message)
         {
-            var random = new Random(producerId);
-            var jobTypes = Enum.GetValues(typeof(JobType)).Cast<JobType>().ToArray();
+            SemaphoreSlim fileSemaphore = new SemaphoreSlim(1, 1);
+            await fileSemaphore.WaitAsync();
+            try
+            {
+                await File.AppendAllTextAsync("system_events.log", message + Environment.NewLine);
+                Console.WriteLine(message);
+            }
+            finally
+            {
+                fileSemaphore.Release();
+            }
+        }
 
-            while (!cancellationToken.IsCancellationRequested)
+        private static async Task ProducerLoop(ProcessingSystem system)
+        {
+            Random rnd = new Random();
+            while (true)
             {
                 try
                 {
-                    // Wait random time between 500ms and 2000ms
-                    await Task.Delay(random.Next(500, 2000), cancellationToken);
+                    JobType type = rnd.NextDouble() > 0.5 ? JobType.Prime : JobType.IO;
+                    string payload = type == JobType.Prime
+                        ? $"{rnd.Next(100, 10000)},{rnd.Next(1, 10)}"
+                        : $"{rnd.Next(100, 2500)}";
 
-                    var jobType = jobTypes[random.Next(jobTypes.Length)];
-                    var priority = random.Next(1, 5);
-                    var job = GenerateRandomJob(jobType, random);
-                    job.Priority = priority;
+                    Job newJob = new Job
+                    {
+                        Id = Guid.NewGuid(),
+                        Type = type,
+                        Payload = payload,
+                        Priority = rnd.Next(1, 10)
+                    };
 
-                    var handle = processingSystem.Submit(job);
-                    Console.WriteLine($"[PRODUCER-{producerId}] Generated job {job.Id} ({job.Type}), Priority: {priority}");
-                }
-                catch (InvalidOperationException)
-                {
-                    // Queue is full, wait and retry
-                    await Task.Delay(1000, cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
+                    JobHandle handle = system.Submit(newJob);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[PRODUCER-{producerId}] Error: {ex.Message}");
+                    Console.WriteLine($"Producer warning: {ex.Message}");
                 }
-            }
-        }
 
-        static Job GenerateRandomJob(JobType jobType, Random random)
-        {
-            return jobType switch
-            {
-                JobType.Prime =>
-                    new Job(
-                        JobType.Prime,
-                        $"numbers:{random.Next(5000, 50000)},threads:{random.Next(1, 8)}",
-                        0
-                    ),
-                JobType.IO =>
-                    new Job(
-                        JobType.IO,
-                        $"delay:{random.Next(100, 2000)}",
-                        0
-                    ),
-                _ => throw new ArgumentException($"Unknown job type: {jobType}")
-            };
+                await Task.Delay(rnd.Next(500, 1500));
+            }
         }
     }
 }

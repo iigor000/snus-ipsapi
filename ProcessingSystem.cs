@@ -1,254 +1,243 @@
-using System.Collections.Concurrent;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml.Linq;
 
 namespace IndustrialProcessingSystem
 {
-    /// <summary>
-    /// Thread-safe service for processing industrial jobs
-    /// </summary>
-    public class ProcessingSystem : IDisposable
+    public class ProcessingSystem
     {
-        private readonly PriorityQueue<Job, (int Priority, DateTime CreatedAt)> _jobQueue;
-        private readonly ConcurrentDictionary<Guid, Job> _jobs;
-        private readonly ConcurrentDictionary<Guid, TaskCompletionSource<int>> _jobResults;
-        private readonly ConcurrentDictionary<Guid, JobExecutionState> _executionStates;
+        // Thread-safe komponente
+        private readonly PriorityQueue<Job, int> _queue = new PriorityQueue<Job, int>();
+        private readonly Dictionary<Guid, Job> _allJobs = new Dictionary<Guid, Job>();
+        private readonly Dictionary<Guid, TaskCompletionSource<int>> _tcsMap = new Dictionary<Guid, TaskCompletionSource<int>>();
+        private readonly List<JobRecord> _history = new List<JobRecord>();
+        private readonly object _lock = new object();
+
         private readonly int _maxQueueSize;
-        private readonly int _workerCount;
-        private readonly CancellationTokenSource _cancellationTokenSource;
-        private readonly List<Task> _workerTasks;
-        private readonly SemaphoreSlim _jobAvailable;
-        private readonly object _queueLock = new object();
+        private int _reportIndex = 0; // Za cirkularnih 10 fajlova
 
-        public event EventHandler<JobCompletedEventArgs>? JobCompleted;
-        public event EventHandler<JobFailedEventArgs>? JobFailed;
-
-        private const int JOB_TIMEOUT_MS = 2000;
-        private const int MAX_RETRIES = 2;
+        // Događaji (Func koristimo za asinhrono okidanje)
+        public event Func<Guid, int, string, Task> JobCompleted;
+        public event Func<Guid, int, string, Task> JobFailed;
 
         public ProcessingSystem(int workerCount, int maxQueueSize)
         {
-            _workerCount = workerCount;
             _maxQueueSize = maxQueueSize;
-            _jobQueue = new PriorityQueue<Job, (int, DateTime)>();
-            _jobs = new ConcurrentDictionary<Guid, Job>();
-            _jobResults = new ConcurrentDictionary<Guid, TaskCompletionSource<int>>();
-            _executionStates = new ConcurrentDictionary<Guid, JobExecutionState>();
-            _cancellationTokenSource = new CancellationTokenSource();
-            _jobAvailable = new SemaphoreSlim(0);
-            _workerTasks = new List<Task>();
 
-            StartWorkers();
+            // Pokretanje worker niti (Consumeri)
+            for (int i = 0; i < workerCount; i++)
+            {
+                Thread worker = new Thread(WorkerLoop) { IsBackground = true };
+                worker.Start();
+            }
+
+            // Pokretanje generatora izveštaja (svaki minut)
+            Task.Run(ReportLoopAsync);
         }
 
-        /// <summary>
-        /// Submits a job for processing
-        /// </summary>
         public JobHandle Submit(Job job)
         {
-            lock (_queueLock)
+            lock (_lock)
             {
-                if (_jobQueue.Count >= _maxQueueSize)
-                    throw new InvalidOperationException("Queue is full");
+                // Idempotentnost: Ako posao već postoji, odbij
+                if (_allJobs.ContainsKey(job.Id))
+                    return null;
+
+                // MaxQueueSize provera
+                if (_queue.Count >= _maxQueueSize)
+                    throw new InvalidOperationException("Queue is full!");
 
                 var tcs = new TaskCompletionSource<int>();
-                _jobs.TryAdd(job.Id, job);
-                _jobResults.TryAdd(job.Id, tcs);
-                _executionStates.TryAdd(job.Id, new JobExecutionState());
 
-                _jobQueue.Enqueue(job, (job.Priority, job.CreatedAt));
-                _jobAvailable.Release();
+                _allJobs[job.Id] = job;
+                _tcsMap[job.Id] = tcs;
+                _queue.Enqueue(job, job.Priority);
 
-                return new JobHandle(job.Id, tcs.Task);
+                Monitor.Pulse(_lock); // Budi worker nit
+
+                return new JobHandle { Id = job.Id, Result = tcs.Task };
             }
         }
 
-        /// <summary>
-        /// Gets the top N jobs by priority from the current queue
-        /// </summary>
+        private void WorkerLoop()
+        {
+            while (true)
+            {
+                Job currentJob = null;
+                TaskCompletionSource<int> currentTcs = null;
+
+                lock (_lock)
+                {
+                    while (_queue.Count == 0)
+                    {
+                        Monitor.Wait(_lock); // Nit spava dok nema posla
+                    }
+                    currentJob = _queue.Dequeue();
+                    currentTcs = _tcsMap[currentJob.Id];
+                }
+
+                // Obrada posla van lock-a da ne bismo blokirali ostale niti
+                _ = ProcessJobWithRetryAsync(currentJob, currentTcs);
+            }
+        }
+
+        private async Task ProcessJobWithRetryAsync(Job job, TaskCompletionSource<int> tcs)
+        {
+            int attempts = 0;
+            bool success = false;
+            Stopwatch sw = new Stopwatch();
+
+            while (attempts < 3 && !success)
+            {
+                attempts++;
+                sw.Restart();
+
+                var processTask = ExecuteJobLogicAsync(job);
+                var timeoutTask = Task.Delay(2000); // Fail ako traje duže od 2 sekunde
+
+                var completedTask = await Task.WhenAny(processTask, timeoutTask);
+
+                sw.Stop();
+
+                if (completedTask == processTask)
+                {
+                    // Uspesno zavrseno unutar 2 sekunde
+                    int result = await processTask;
+                    success = true;
+
+                    tcs.TrySetResult(result);
+                    if (JobCompleted != null) await JobCompleted.Invoke(job.Id, result, "SUCCESS");
+
+                    lock (_lock) _history.Add(new JobRecord { Job = job, Status = "SUCCESS", Duration = sw.Elapsed });
+                }
+                else
+                {
+                    // Timeout (Fail)
+                    if (JobFailed != null) await JobFailed.Invoke(job.Id, 0, $"FAILED (Attempt {attempts})");
+                }
+            }
+
+            if (!success)
+            {
+                // Abort posle 3 pokusaja
+                if (JobFailed != null) await JobFailed.Invoke(job.Id, 0, "ABORT");
+                tcs.TrySetException(new TimeoutException("Job aborted after 3 failed attempts."));
+                lock (_lock) _history.Add(new JobRecord { Job = job, Status = "ABORT", Duration = sw.Elapsed });
+            }
+        }
+
+        private async Task<int> ExecuteJobLogicAsync(Job job)
+        {
+            if (job.Type == JobType.Prime)
+            {
+                // Payload format: "10000,3" (maxVal,threads)
+                var parts = job.Payload.Split(',');
+                int maxVal = int.Parse(parts[0]);
+                int threads = Math.Clamp(int.Parse(parts[1]), 1, 8);
+
+                return await Task.Run(() => CalculatePrimes(maxVal, threads));
+            }
+            else // IO
+            {
+                // Payload format: "1000" (delay in ms)
+                int delay = int.Parse(job.Payload);
+                await Task.Delay(delay);
+                return new Random().Next(0, 101);
+            }
+        }
+
+        private int CalculatePrimes(int maxVal, int threads)
+        {
+            int count = 0;
+            object primeLock = new object();
+
+            Parallel.For(2, maxVal + 1, new ParallelOptions { MaxDegreeOfParallelism = threads }, i =>
+            {
+                bool isPrime = true;
+                for (int j = 2; j <= Math.Sqrt(i); j++)
+                {
+                    if (i % j == 0) { isPrime = false; break; }
+                }
+                if (isPrime)
+                {
+                    lock (primeLock) count++;
+                }
+            });
+            return count;
+        }
+
         public IEnumerable<Job> GetTopJobs(int n)
         {
-            lock (_queueLock)
+            lock (_lock)
             {
-                var jobs = new List<Job>();
-                var tempQueue = new PriorityQueue<Job, (int Priority, DateTime CreatedAt)>();
-
-                // Copy all jobs from main queue
-                while (_jobQueue.Count > 0)
-                {
-                    var job = _jobQueue.Dequeue();
-                    tempQueue.Enqueue(job, (job.Priority, job.CreatedAt));
-                }
-
-                // Get top N
-                for (int i = 0; i < n && tempQueue.Count > 0; i++)
-                {
-                    var job = tempQueue.Dequeue();
-                    jobs.Add(job);
-                }
-
-                // Restore queue
-                foreach (var job in jobs.Union(tempQueue.UnorderedItems.Select(x => x.Element)))
-                {
-                    _jobQueue.Enqueue(job, (job.Priority, job.CreatedAt));
-                }
-
-                return jobs;
+                return _queue.UnorderedItems
+                    .OrderBy(x => x.Priority)
+                    .Select(x => x.Element)
+                    .Take(n)
+                    .ToList();
             }
         }
 
-        /// <summary>
-        /// Gets a job by its ID
-        /// </summary>
-        public Job? GetJob(Guid id)
+        public Job GetJob(Guid id)
         {
-            _jobs.TryGetValue(id, out var job);
-            return job;
-        }
-
-        private void StartWorkers()
-        {
-            for (int i = 0; i < _workerCount; i++)
+            lock (_lock)
             {
-                var workerTask = Task.Run(async () => await WorkerLoop());
-                _workerTasks.Add(workerTask);
+                return _allJobs.ContainsKey(id) ? _allJobs[id] : null;
             }
         }
 
-        private async Task WorkerLoop()
+        private async Task ReportLoopAsync()
         {
-            while (!_cancellationTokenSource.Token.IsCancellationRequested)
+            if (!Directory.Exists("Reports")) Directory.CreateDirectory("Reports");
+
+            while (true)
             {
-                try
-                {
-                    await _jobAvailable.WaitAsync(_cancellationTokenSource.Token);
+                await Task.Delay(TimeSpan.FromMinutes(1));
 
-                    Job? job = null;
-                    lock (_queueLock)
-                    {
-                        if (_jobQueue.Count > 0)
-                            job = _jobQueue.Dequeue();
-                    }
-
-                    if (job == null)
-                        continue;
-
-                    await ProcessJob(job);
-                }
-                catch (OperationCanceledException)
+                List<JobRecord> currentHistory;
+                lock (_lock)
                 {
-                    break;
+                    currentHistory = _history.ToList();
                 }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Worker error: {ex.Message}");
-                }
+
+                // Generisanje izveštaja LINQ-om
+                var reportData = from x in currentHistory
+                                 group x by x.Job.Type into g
+                                 select new
+                                 {
+                                     Type = g.Key,
+                                     CompletedCount = g.Count(x => x.Status == "SUCCESS"),
+                                     AvgTimeMs = g.Any(x => x.Status == "SUCCESS")
+                                                 ? g.Where(x => x.Status == "SUCCESS").Average(x => x.Duration.TotalMilliseconds)
+                                                 : 0,
+                                     FailedRecords = (from f in g
+                                                      where f.Status == "ABORT"
+                                                      orderby f.Job.Priority
+                                                      select f).ToList()
+                                 };
+
+                // Zapis u XML fajl (Cirkularno čuvanje, prepisuje najstariji)
+                XElement xml = new XElement("Report",
+                    reportData.Select(r => new XElement("JobGroup",
+                        new XAttribute("Type", r.Type),
+                        new XElement("Completed", r.CompletedCount),
+                        new XElement("AverageTimeMs", r.AvgTimeMs),
+                        new XElement("FailedJobs",
+                            r.FailedRecords.Select(f => new XElement("Job", new XAttribute("Id", f.Job.Id), new XAttribute("Priority", f.Job.Priority)))
+                        )
+                    ))
+                );
+
+                string filePath = Path.Combine("Reports", $"report_{_reportIndex}.xml");
+                xml.Save(filePath);
+
+                _reportIndex = (_reportIndex + 1) % 10; // Vraća na 0 nakon 9 (čuva poslednjih 10 fajlova)
             }
-        }
-
-        private async Task ProcessJob(Job job)
-        {
-            var state = _executionStates[job.Id];
-            var startTime = DateTime.UtcNow;
-            int result = 0;
-            bool success = false;
-
-            try
-            {
-                int attempt = 0;
-                while (attempt <= MAX_RETRIES)
-                {
-                    state.Attempts++;
-                    attempt++;
-
-                    try
-                    {
-                        using (var cts = new CancellationTokenSource(JOB_TIMEOUT_MS))
-                        {
-                            result = job.Type switch
-                            {
-                                JobType.Prime => await JobProcessor.ProcessPrime(job.Payload, cts.Token),
-                                JobType.IO => await JobProcessor.ProcessIO(job.Payload, cts.Token),
-                                _ => throw new InvalidOperationException($"Unknown job type: {job.Type}")
-                            };
-
-                            success = true;
-                            break;
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        if (attempt > MAX_RETRIES)
-                        {
-                            throw;
-                        }
-                    }
-                }
-
-                if (success && _jobResults.TryGetValue(job.Id, out var tcs))
-                {
-                    tcs.SetResult(result);
-                    var executionTime = DateTime.UtcNow - startTime;
-                    state.ExecutionTime = executionTime;
-
-                    OnJobCompleted(new JobCompletedEventArgs
-                    {
-                        JobId = job.Id,
-                        Result = result,
-                        CompletedAt = DateTime.UtcNow,
-                        ExecutionTime = executionTime,
-                        JobType = job.Type
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                var executionTime = DateTime.UtcNow - startTime;
-                state.ExecutionTime = executionTime;
-                state.Failed = true;
-
-                if (_jobResults.TryGetValue(job.Id, out var tcs))
-                {
-                    tcs.SetException(ex);
-                }
-
-                OnJobFailed(new JobFailedEventArgs
-                {
-                    JobId = job.Id,
-                    Reason = ex.Message,
-                    FailedAt = DateTime.UtcNow,
-                    ExecutionTime = executionTime,
-                    JobType = job.Type,
-                    Attempts = state.Attempts
-                });
-            }
-        }
-
-        private void OnJobCompleted(JobCompletedEventArgs e)
-        {
-            JobCompleted?.Invoke(this, e);
-        }
-
-        private void OnJobFailed(JobFailedEventArgs e)
-        {
-            JobFailed?.Invoke(this, e);
-        }
-
-        public void Dispose()
-        {
-            _cancellationTokenSource?.Cancel();
-            Task.WaitAll(_workerTasks.ToArray(), TimeSpan.FromSeconds(10));
-            _cancellationTokenSource?.Dispose();
-            _jobAvailable?.Dispose();
-        }
-
-        /// <summary>
-        /// Internal class to track job execution state
-        /// </summary>
-        private class JobExecutionState
-        {
-            public int Attempts { get; set; }
-            public bool Failed { get; set; }
-            public TimeSpan ExecutionTime { get; set; }
         }
     }
 }
