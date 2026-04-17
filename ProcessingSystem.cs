@@ -497,7 +497,7 @@ public sealed class ProcessingSystem : IAsyncDisposable
     {
         var payloadMap = ParsePayloadMap(payload);
         var delayMs = ParseInt(RequirePayloadValue(payloadMap, "delay"), 0);
-        await Task.Run(() => Thread.Sleep(Math.Max(0, delayMs)), cancellationToken);
+        await Task.Delay(Math.Max(0, delayMs), cancellationToken);
         return Random.Shared.Next(0, 101);
     }
 
