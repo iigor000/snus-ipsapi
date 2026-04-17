@@ -1,32 +1,31 @@
-using System;
-using System.Threading.Tasks;
+namespace SnusProj;
 
-namespace IndustrialProcessingSystem
+public enum JobType
 {
-    public enum JobType
-    {
-        Prime,
-        IO
-    }
+    Prime,
+    IO
+}
 
-    public class Job
-    {
-        public Guid Id { get; set; }
-        public JobType Type { get; set; }
-        public string Payload { get; set; }
-        public int Priority { get; set; }
-    }
+public sealed class Job
+{
+    public Guid Id { get; init; }
+    public JobType Type { get; init; }
+    public string Payload { get; init; } = string.Empty;
+    public int Priority { get; init; }
+}
 
-    public class JobHandle
-    {
-        public Guid Id { get; set; }
-        public Task<int> Result { get; set; }
-    }
+public sealed class JobHandle
+{
+    public Guid Id { get; init; }
+    public Task<int> Result { get; init; } = Task.FromException<int>(new InvalidOperationException("No result available."));
+}
 
-    public class JobRecord
-    {
-        public Job Job { get; set; }
-        public string Status { get; set; } // "SUCCESS", "FAILED", "ABORT"
-        public TimeSpan Duration { get; set; }
-    }
+public sealed class JobEventArgs
+{
+    public Guid JobId { get; init; }
+    public JobType Type { get; init; }
+    public int? Result { get; init; }
+    public string Status { get; init; } = string.Empty;
+    public int Attempt { get; init; }
+    public string? ErrorMessage { get; init; }
 }

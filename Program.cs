@@ -1,102 +1,152 @@
-using System;
-using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Xml.Linq;
+namespace SnusProj;
 
-namespace IndustrialProcessingSystem
+internal static class Program
 {
-    class Program
+    private static async Task Main()
     {
-        private static object _fileLock = new object();
-
-        static async Task Main(string[] args)
+        try
         {
-            // 1. Čitanje konfiguracije
-            Console.WriteLine($"Tražim fajl na: {Path.GetFullPath("SystemConfig.xml")}");
-            XDocument config = XDocument.Load("SystemConfig.xml");
-            var root = config.Root;
-
-            int workerCount = int.Parse(root.Element("WorkerCount").Value);
-            int maxQueue = int.Parse(root.Element("MaxQueueSize").Value);
-
-            ProcessingSystem system = new ProcessingSystem(workerCount, maxQueue);
-
-            // Pretplata na evente
-            system.JobCompleted += async (id, result, status) => { await WriteLogAsync($"[{DateTime.Now}] [{status}] {id}, {result}"); };
-            system.JobFailed += async (id, result, status) => { await WriteLogAsync($"[{DateTime.Now}] [{status}] {id}, {result}"); };
-
-            Console.WriteLine("Sistem inicijalizovan. Učitavam početne poslove iz XML-a...");
-
-            // 2. Inicijalno učitavanje poslova iz XML-a
-            foreach (var jobXml in root.Descendants("Job"))
+            var configPath = Path.Combine(AppContext.BaseDirectory, "SystemConfig.xml");
+            if (!File.Exists(configPath))
             {
-                Job initialJob = new Job
+                throw new FileNotFoundException($"Required configuration file is missing: {configPath}");
+            }
+
+            CleanupRunArtifacts(configPath);
+
+            var producerThreadCount = ReadProducerThreadCount(configPath);
+
+            await using var system = new ProcessingSystem(configPath);
+            using var shutdownCts = new CancellationTokenSource();
+            var shutdownToken = shutdownCts.Token;
+
+            Console.CancelKeyPress += (_, eventArgs) =>
+            {
+                eventArgs.Cancel = true;
+                if (!shutdownCts.IsCancellationRequested)
                 {
-                    Id = Guid.NewGuid(),
-                    Type = Enum.Parse<JobType>(jobXml.Attribute("Type").Value),
-                    Payload = jobXml.Attribute("Payload").Value,
-                    Priority = int.Parse(jobXml.Attribute("Priority").Value)
-                };
+                    Console.WriteLine("Shutdown requested. Stopping producers...");
+                    shutdownCts.Cancel();
+                }
+            };
 
-                system.Submit(initialJob);
-            }
-
-            Console.WriteLine("Početni poslovi ubačeni. Pokrećem nasumične producente...");
-
-            // 3. Pokretanje "Producenata"
-            for (int i = 0; i < 5; i++)
+            system.JobCompleted += eventArgs =>
             {
-                Task.Run(() => ProducerLoop(system));
-            }
+                Console.WriteLine($"COMPLETED: {eventArgs.JobId} -> {eventArgs.Result}");
+                return Task.CompletedTask;
+            };
 
-            Console.ReadLine();
-        }
+            system.JobFailed += eventArgs =>
+            {
+                Console.WriteLine($"{eventArgs.Status}: {eventArgs.JobId} (attempt {eventArgs.Attempt})");
+                return Task.CompletedTask;
+            };
 
-        private static async Task WriteLogAsync(string message)
-        {
-            SemaphoreSlim fileSemaphore = new SemaphoreSlim(1, 1);
-            await fileSemaphore.WaitAsync();
-            try
-            {
-                await File.AppendAllTextAsync("system_events.log", message + Environment.NewLine);
-                Console.WriteLine(message);
-            }
-            finally
-            {
-                fileSemaphore.Release();
-            }
-        }
-
-        private static async Task ProducerLoop(ProcessingSystem system)
-        {
-            Random rnd = new Random();
-            while (true)
-            {
-                try
+            var producerTasks = Enumerable.Range(0, producerThreadCount)
+                .Select(index => Task.Run(async () =>
                 {
-                    JobType type = rnd.NextDouble() > 0.5 ? JobType.Prime : JobType.IO;
-                    string payload = type == JobType.Prime
-                        ? $"{rnd.Next(100, 10000)},{rnd.Next(1, 10)}"
-                        : $"{rnd.Next(100, 2500)}";
-
-                    Job newJob = new Job
+                    while (!shutdownToken.IsCancellationRequested)
                     {
-                        Id = Guid.NewGuid(),
-                        Type = type,
-                        Payload = payload,
-                        Priority = rnd.Next(1, 10)
-                    };
+                        try
+                        {
+                            var job = CreateRandomJob();
+                            var handle = system.Submit(job);
+                            _ = ObserveHandleAsync(handle);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Producer {index} submit error: {ex.Message}");
+                        }
 
-                    JobHandle handle = system.Submit(newJob);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Producer warning: {ex.Message}");
-                }
+                        try
+                        {
+                            await Task.Delay(Random.Shared.Next(20, 90), shutdownToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                    }
+                }, shutdownToken))
+                .ToArray();
 
-                await Task.Delay(rnd.Next(500, 1500));
-            }
+            Console.WriteLine("Producers are running. Press Ctrl+C to stop.");
+
+            await Task.WhenAll(producerTasks);
+
+            await system.GenerateReportAsync();
+
+            Console.WriteLine($"Top 5 jobs currently in queue: {system.GetTopJobs(5).Count()}");
         }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Fatal error: {ex.Message}");
+        }
+    }
+
+    private static async Task ObserveHandleAsync(JobHandle handle)
+    {
+        try
+        {
+            _ = await handle.Result;
+        }
+        catch
+        {
+            // Job can fail and be aborted after retries.
+        }
+    }
+
+    private static void CleanupRunArtifacts(string configPath)
+    {
+        var baseDirectory = Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? ".";
+        var logFilePath = Path.Combine(baseDirectory, "processing.log");
+        var reportDirectory = Path.Combine(baseDirectory, "reports");
+
+        if (File.Exists(logFilePath))
+        {
+            File.Delete(logFilePath);
+        }
+
+        if (Directory.Exists(reportDirectory))
+        {
+            Directory.Delete(reportDirectory, recursive: true);
+        }
+    }
+
+    private static int ReadProducerThreadCount(string configPath)
+    {
+        var document = System.Xml.Linq.XDocument.Load(configPath);
+        var workerCountText = document.Root?.Element("WorkerCount")?.Value;
+
+        if (!int.TryParse(workerCountText, out var parsed))
+        {
+            throw new InvalidOperationException("WorkerCount must be present and valid in SystemConfig.xml.");
+        }
+
+        return Math.Max(1, parsed);
+    }
+
+    private static Job CreateRandomJob()
+    {
+        var type = Random.Shared.Next(0, 2) == 0 ? JobType.Prime : JobType.IO;
+
+        var payload = type switch
+        {
+            JobType.Prime => $"numbers:{Random.Shared.Next(20_000, 40_000)},threads:{Random.Shared.Next(1, 12)}",
+            JobType.IO => $"delay:{Random.Shared.Next(100, 2_600)}",
+            _ => "delay:100"
+        };
+
+        return new Job
+        {
+            Id = Guid.NewGuid(),
+            Type = type,
+            Payload = payload,
+            Priority = Random.Shared.Next(1, 11)
+        };
     }
 }
